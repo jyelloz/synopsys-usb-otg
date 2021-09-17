@@ -105,7 +105,7 @@ impl <P: UsbPeripheral> USB<P> {
         }
     }
 
-    fn _enable(&self, cs: &CriticalSection) {
+    fn enable(&self, cs: &CriticalSection) {
         let regs = self.regs.borrow(cs);
 
         // Wait for AHB ready
@@ -190,12 +190,10 @@ impl <P: UsbPeripheral> USB<P> {
         }
         if wakeup != 0 {
             write_reg!(otg_global, regs.global(), GINTSTS, WKUPINT: 1);
-            // bkpt();
             return PollResult::Resume;
         }
         if suspend != 0 {
             write_reg!(otg_global, regs.global(), GINTSTS, USBSUSP: 1);
-            bkpt();
             return PollResult::Suspend;
         }
 
@@ -215,17 +213,10 @@ impl <P: UsbPeripheral> USB<P> {
             match status {
                 0x02 => { // OUT received
                     ep_out |= 1 << epnum;
-                    self.ctrl_out.set_bytes_to_read(cs, Some(data_size as usize));
                 },
                 0x06 => { // SETUP received
                     // flushing TX if something stuck in control endpoint
-                    self.flush_txfifo(epnum, regs);
-                    read_reg!(otg_global, regs.global(), GRXSTSP); // pop GRXSTSP
-                    modify_reg!(otg_device, regs.device(), DOEPTSIZ0,
-                    STUPCNT: 3
-                    );
                     ep_setup |= 1 << epnum;
-                    self.ctrl_out.set_bytes_to_read(cs, Some(data_size as usize));
                 },
                 0x03 | 0x04 => { // OUT or SETUP completed
                     read_reg!(otg_global, regs.global(), GRXSTSP); // pop GRXSTSP
@@ -260,7 +251,7 @@ impl <P: UsbPeripheral> USB<P> {
         PollResult::None
     }
 
-    // 14.4.1.1
+    // 14.4.4.1.1
     fn handle_reset(&self, regs: &UsbRegisters) {
 
         // 1.
@@ -291,7 +282,6 @@ impl <P: UsbPeripheral> USB<P> {
 
         // 4.
         modify_reg!(otg_global, regs.global(), GRXFSIZ,
-            // XXX: hopefully a safe value.
             RXFD: 256
         );
         write_reg!(otg_global, regs.global(), DIEPTXF0,
@@ -304,20 +294,18 @@ impl <P: UsbPeripheral> USB<P> {
             STUPCNT: 3
         );
 
-        self.deconfigure_all(regs);
-
-        modify_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH: 1);
-        while read_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH) == 1 {}
-
     }
 
-    // 14.4.1.1
+    // 14.4.4.1.2
     fn handle_enum(&self, regs: &UsbRegisters) {
         modify_reg!(otg_device, regs.device(),
             DIEPCTL0,
-            MPSIZ: 3
+            MPSIZ: 0
         );
-        modify_reg!(otg_global, regs.global(), GUSBCFG, TRDT: 5);
+        modify_reg!(otg_device, regs.device(),
+            DOEPCTL0,
+            EPENA: 1
+        );
     }
 
     fn reset(&self, regs: &UsbRegisters) {
@@ -461,7 +449,7 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
     fn enable(&mut self) {
         interrupt::free(|cs| {
             P::enable();
-            self._enable(cs);
+            USB::enable(self, cs);
         });
     }
 
