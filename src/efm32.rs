@@ -23,6 +23,7 @@ use crate::{
         otg_device,
         otg_pwrclk,
         endpoint_in,
+        endpoint_out,
     },
     target::{
         UsbRegisters,
@@ -30,12 +31,12 @@ use crate::{
     },
 };
 
-struct SetupPacket {
+struct Packet {
     buf: [u8; 128],
     length: Option<usize>,
 }
 
-impl SetupPacket {
+impl Packet {
 
     fn buf(&self) -> Option<&[u8]> {
         if let Some(length) = self.length {
@@ -55,7 +56,7 @@ impl SetupPacket {
 
 }
 
-impl Default for SetupPacket {
+impl Default for Packet {
     fn default() -> Self {
         Self {
             buf: [0; 128],
@@ -66,7 +67,8 @@ impl Default for SetupPacket {
 
 pub struct USB<P> {
     regs: Mutex<UsbRegisters>,
-    setup_packet: Mutex<RefCell<SetupPacket>>,
+    out_packet: Mutex<RefCell<Packet>>,
+    setup_packet: Mutex<RefCell<Packet>>,
     _marker: PhantomData<P>,
 }
 
@@ -76,6 +78,7 @@ impl <P: UsbPeripheral> USB<P> {
         Self {
             regs: Mutex::new(UsbRegisters::new::<P>()),
             _marker: PhantomData,
+            out_packet: Mutex::new(RefCell::new(Default::default())),
             setup_packet: Mutex::new(RefCell::new(Default::default())),
         }
     }
@@ -135,9 +138,6 @@ impl <P: UsbPeripheral> USB<P> {
     }
 
     fn set_device_address(&self, regs: &UsbRegisters, addr: u32) {
-        if addr != 0 {
-            bkpt();
-        }
         modify_reg!(otg_device, regs.device(), DCFG, DAD: addr);
     }
 
@@ -178,7 +178,7 @@ impl <P: UsbPeripheral> USB<P> {
         let (epnum, data_size, status) = read_reg!(
             otg_global,
             regs.global(),
-            GRXSTSR,
+            GRXSTSP,
             EPNUM,
             BCNT,
             PKTSTS
@@ -186,30 +186,43 @@ impl <P: UsbPeripheral> USB<P> {
         if rxflvl != 0 {
             match status {
                 0x02 => { // OUT received
+                    let mut out = self.out_packet.borrow(cs).borrow_mut();
+                    let buf = out.mut_buf();
+                    let len = buf.len().min(data_size as usize);
+                    let buf = &mut buf[..len];
+                    let length = self.read_fifo(regs, buf).ok();
+                    out.update(length);
                     ep_out |= 1 << epnum;
                 },
                 0x06 => { // SETUP received
                     let mut setup = self.setup_packet.borrow(cs).borrow_mut();
                     let buf = setup.mut_buf();
+                    let len = buf.len().min(data_size as usize);
+                    let buf = &mut buf[..len];
                     let length = self.read_fifo(regs, buf).ok();
                     setup.update(length);
-                    read_reg!(otg_global, regs.global(), GRXSTSP); // pop GRXSTSP
-                    modify_reg!(otg_device, regs.device(), DOEPCTL0, CNAK: 1, EPENA: 1);
                     ep_setup |= 1 << epnum;
                 },
-                0x03 | 0x04 => { // OUT or SETUP completed
-                    read_reg!(otg_global, regs.global(), GRXSTSP); // pop GRXSTSP
+                0x03 => { // OUT completed
+                },
+                0x04 => { // SETUP completed
+                    modify_reg!(otg_device, regs.device(), DOEPTSIZ0,
+                        STUPCNT: 3
+                    );
+                    // XXX: p.191 EFM32 manual
+                    modify_reg!(otg_device, regs.device(), DOEPCTL0, CNAK: 1, EPENA: 1);
                 },
                 _ => {
-                    read_reg!(otg_global, regs.global(), GRXSTSP); // pop GRXSTSP
                 },
             }
 
             if iep != 0 {
-                for ep in 0..3 {
-                    let ep_regs = regs.endpoint_in(ep as usize);
+                for ep in 0..3usize {
+                    let ep_regs = regs.endpoint_in(ep);
+                    let oep_regs = regs.endpoint_out(ep);
                     if read_reg!(endpoint_in, ep_regs, DIEPINT, XFRC) != 0 {
                         write_reg!(endpoint_in, ep_regs, DIEPINT, XFRC: 1);
+                        modify_reg!(endpoint_out, oep_regs, DOEPCTL, CNAK: 1, EPENA: 1);
                         ep_in_complete |= 1 << ep;
                     }
                 }
@@ -310,7 +323,7 @@ impl <P: UsbPeripheral> USB<P> {
         let packet_count = if len == available_space { 2 } else { 1 };
         modify_reg!(endpoint_in, ep_regs,
             DIEPTSIZ,
-            PKTCNT: 1,
+            PKTCNT: packet_count,
             XFRSIZ: len as u32
         );
         modify_reg!(endpoint_in, ep_regs, DIEPCTL, EPENA: 1, CNAK: 1);
@@ -320,9 +333,7 @@ impl <P: UsbPeripheral> USB<P> {
     }
 
     fn read_fifo(&self, regs: &UsbRegisters, buf: &mut[u8]) -> Result<usize> {
-        let data_size = read_reg!(otg_global, regs.global(), GRXSTSP, BCNT);
-        let len = buf.len().min(data_size as usize);
-        let buf = &mut buf[..len];
+        let len = buf.len();
         let fifo = regs.fifo(0);
         for chunk in buf.chunks_exact_mut(4) {
             let word = fifo.read().to_ne_bytes();
@@ -345,6 +356,7 @@ impl <P: UsbPeripheral> USB<P> {
             return Ok(0);
         }
         let mut setup_packet = self.setup_packet.borrow(cs).borrow_mut();
+        let mut out_packet = self.out_packet.borrow(cs).borrow_mut();
         if let Some(setup) = setup_packet.buf() {
             let setup_len = setup.len();
             if len < setup_len {
@@ -354,6 +366,15 @@ impl <P: UsbPeripheral> USB<P> {
             buf.copy_from_slice(setup);
             setup_packet.update(None);
             Ok(setup_len)
+        } else if let Some(out) = out_packet.buf() {
+            let out_len = out.len();
+            if len < out_len {
+                return Err(UsbError::BufferOverflow);
+            }
+            let buf = &mut buf[..out_len];
+            buf.copy_from_slice(out);
+            out_packet.update(None);
+            Ok(out_len)
         } else {
             let regs = self.regs.borrow(cs);
             self.read_fifo(regs, buf)
@@ -376,7 +397,6 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
     }
 
     fn set_device_address(&self, addr: u8) {
-        if addr != 0 { bkpt(); }
         interrupt::free(|cs| {
             let regs = self.regs.borrow(cs);
             self.set_device_address(regs, addr.into());
