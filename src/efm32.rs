@@ -189,15 +189,11 @@ impl <P: UsbPeripheral> USB<P> {
                     ep_out |= 1 << epnum;
                 },
                 0x06 => { // SETUP received
-                    let stupcnt = read_reg!(otg_device, regs.device(), DOEPTSIZ0, STUPCNT);
-                    // hprintln!("stupcnt={:x}", stupcnt).ok();
                     let mut setup = self.setup_packet.borrow(cs).borrow_mut();
                     let buf = setup.mut_buf();
                     let length = self.read_fifo(regs, buf).ok();
                     setup.update(length);
-                    // bkpt();
                     read_reg!(otg_global, regs.global(), GRXSTSP); // pop GRXSTSP
-                    // return PollResult::None;
                     modify_reg!(otg_device, regs.device(), DOEPCTL0, CNAK: 1, EPENA: 1);
                     ep_setup |= 1 << epnum;
                 },
@@ -273,8 +269,6 @@ impl <P: UsbPeripheral> USB<P> {
         modify_reg!(otg_device, regs.device(), DOEPTSIZ0,
             STUPCNT: 3
         );
-
-        // hprintln!("handle reset").unwrap();
     }
 
     // 14.4.4.1.2
@@ -288,7 +282,6 @@ impl <P: UsbPeripheral> USB<P> {
             EPENA: 1,
             CNAK: 1
         );
-        // hprintln!("handle enum").unwrap();
     }
 
     fn reset(&self, regs: &UsbRegisters) {
