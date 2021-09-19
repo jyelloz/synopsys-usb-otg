@@ -193,6 +193,11 @@ impl <P: UsbPeripheral> USB<P> {
                     ep_out |= 1 << epnum;
                 },
                 0x06 => { // SETUP received
+                    let ep = regs.endpoint_in(epnum as usize);
+                    if read_reg!(endpoint_in, ep, DIEPTSIZ, PKTCNT) != 0 {
+                        modify_reg!(otg_global, regs.global(), GRSTCTL, TXFNUM: epnum, TXFFLSH: 1);
+                        while read_reg!(otg_global, regs.global(), GRSTCTL, TXFFLSH) == 1 {}
+                    }
                     let mut setup = self.setup_packet.borrow(cs).borrow_mut();
                     let buf = setup.mut_buf();
                     let len = buf.len().min(data_size as usize);
