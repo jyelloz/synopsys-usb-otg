@@ -21,6 +21,9 @@ pub use crate::bus::UsbBus;
 mod ral;
 mod transition;
 
+#[cfg(all(feature = "fs", feature = "efm32"))]
+pub mod efm32;
+
 /// A trait for device-specific USB peripherals. Implement this to add support for a new hardware
 /// platform. Peripherals that have this trait must have the same register block as STM32 USB OTG
 /// peripherals.
