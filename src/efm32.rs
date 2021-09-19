@@ -11,8 +11,6 @@ use usb_device::{
     endpoint::{EndpointType, EndpointAddress},
 };
 
-use cortex_m_semihosting::hprintln;
-
 use crate::{
     UsbPeripheral,
     ral::{
@@ -203,27 +201,24 @@ impl <P: UsbPeripheral> USB<P> {
                     setup.update(length);
                     ep_setup |= 1 << epnum;
                 },
-                0x03 => { // OUT completed
-                },
-                0x04 => { // SETUP completed
-                    modify_reg!(otg_device, regs.device(), DOEPTSIZ0,
-                        STUPCNT: 3
-                    );
-                    // XXX: p.191 EFM32 manual
+                0x03 | 0x04 => { // OUT completed | SETUP completed
+                    modify_reg!(otg_device, regs.device(), DOEPTSIZ0, STUPCNT: 1);
                     modify_reg!(otg_device, regs.device(), DOEPCTL0, CNAK: 1, EPENA: 1);
+                    return PollResult::None;
                 },
-                _ => {
-                },
+                _ => { },
             }
 
-            if iep != 0 {
-                for ep in 0..3usize {
-                    let ep_regs = regs.endpoint_in(ep);
-                    let oep_regs = regs.endpoint_out(ep);
-                    if read_reg!(endpoint_in, ep_regs, DIEPINT, XFRC) != 0 {
-                        write_reg!(endpoint_in, ep_regs, DIEPINT, XFRC: 1);
-                        modify_reg!(endpoint_out, oep_regs, DOEPCTL, CNAK: 1, EPENA: 1);
-                        ep_in_complete |= 1 << ep;
+            if status == 0x02 || status == 0x06 {
+                let ep = regs.endpoint_out(epnum as usize);
+                modify_reg!(endpoint_out, ep, DOEPCTL, CNAK: 1, EPENA: 1);
+                if iep != 0 {
+                    for ep in 0..3usize {
+                        let ep_regs = regs.endpoint_in(ep);
+                        if read_reg!(endpoint_in, ep_regs, DIEPINT, XFRC) != 0 {
+                            write_reg!(endpoint_in, ep_regs, DIEPINT, XFRC: 1);
+                            ep_in_complete |= 1 << ep;
+                        }
                     }
                 }
             }
@@ -280,7 +275,7 @@ impl <P: UsbPeripheral> USB<P> {
 
         // 5.
         modify_reg!(otg_device, regs.device(), DOEPTSIZ0,
-            STUPCNT: 3
+            STUPCNT: 1
         );
     }
 
@@ -298,15 +293,7 @@ impl <P: UsbPeripheral> USB<P> {
     }
 
     fn reset(&self, regs: &UsbRegisters) {
-        self.configure_all(regs);
         self.set_device_address(regs, 0);
-    }
-
-    fn configure_all(&self, _regs: &UsbRegisters) {
-    }
-
-    fn _deconfigure_all(&self, _regs: &UsbRegisters) {
-
     }
 
     fn write(&self, regs: &UsbRegisters, ep_addr: EndpointAddress, buf: &[u8]) -> Result<usize> {
@@ -328,7 +315,6 @@ impl <P: UsbPeripheral> USB<P> {
         );
         modify_reg!(endpoint_in, ep_regs, DIEPCTL, EPENA: 1, CNAK: 1);
         crate::target::fifo_write(*regs, index, buf);
-        // bkpt();
         Ok(len)
     }
 
@@ -337,7 +323,6 @@ impl <P: UsbPeripheral> USB<P> {
         let fifo = regs.fifo(0);
         for chunk in buf.chunks_exact_mut(4) {
             let word = fifo.read().to_ne_bytes();
-            // bkpt();
             chunk.copy_from_slice(&word);
         }
         let remainder = buf.chunks_exact_mut(4)
@@ -376,8 +361,8 @@ impl <P: UsbPeripheral> USB<P> {
             out_packet.update(None);
             Ok(out_len)
         } else {
-            let regs = self.regs.borrow(cs);
-            self.read_fifo(regs, buf)
+            bkpt();
+            Err(UsbError::WouldBlock)
         }
     }
 
@@ -407,7 +392,6 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
         if ep_addr.index() >= P::ENDPOINT_COUNT {
             return;
         }
-        // if stalled { bkpt(); }
         interrupt::free(|cs| {
             let regs = self.regs.borrow(cs);
             crate::endpoint::set_stalled(*regs, ep_addr, stalled)
@@ -418,7 +402,6 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
         if ep_addr.index() >= P::ENDPOINT_COUNT {
             return true;
         }
-
         interrupt::free(|cs| {
             let regs = self.regs.borrow(cs);
             crate::endpoint::is_stalled(*regs, ep_addr)
