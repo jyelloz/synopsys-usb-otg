@@ -63,10 +63,113 @@ impl Default for Packet {
     }
 }
 
+struct EndpointStack<P> {
+    bitmap: u8,
+    _peripheral_marker: PhantomData<P>,
+}
+impl <P: UsbPeripheral> EndpointStack<P> {
+
+    fn new() -> Self {
+        Self {
+            bitmap: 0,
+            _peripheral_marker: PhantomData,
+        }
+    }
+
+    fn allocate_ep0(&mut self, dir: UsbDirection) -> Result<EndpointAddress> {
+        let addr = EndpointAddress::from_parts(0, dir);
+        self.set_allocated(addr, true);
+        Ok(addr)
+    }
+
+    fn allocate(
+        &mut self,
+        ep_dir: UsbDirection,
+        ep_type: EndpointType,
+        max_packet_size: u16,
+        interval: u8,
+    ) -> Result<EndpointAddress> {
+        if self.num_allocated(ep_dir) >= P::ENDPOINT_COUNT {
+            return Err(UsbError::EndpointOverflow);
+        }
+        for i in 1..P::ENDPOINT_COUNT {
+            let address = EndpointAddress::from_parts(i, ep_dir);
+            if self.is_allocated(address) {
+                continue;
+            }
+            self.set_allocated(address, true);
+            return Ok(address);
+        }
+        Err(UsbError::InvalidEndpoint)
+    }
+
+    fn bitmap_offset(&self, dir: UsbDirection) -> u8 {
+        match dir {
+            UsbDirection::In => 0,
+            UsbDirection::Out => 4,
+        }
+    }
+
+    fn bitmap_nybble(&self, dir: UsbDirection) -> u8 {
+        (self.bitmap >> self.bitmap_offset(dir)) & 0b1111
+    }
+
+    fn num_allocated(&self, ep_dir: UsbDirection) -> usize {
+        self.bitmap_nybble(ep_dir)
+            .count_ones() as usize
+    }
+
+    fn is_allocated(&self, addr: EndpointAddress) -> bool {
+        let index = addr.index();
+        if index >= P::ENDPOINT_COUNT {
+            return false;
+        }
+        (self.bitmap_nybble(addr.direction()) >> index) & 1 == 1
+    }
+
+    fn set_allocated(&mut self, addr: EndpointAddress, allocated: bool) {
+        let index = addr.index();
+        if index >= P::ENDPOINT_COUNT {
+            return;
+        }
+        let offset = self.bitmap_offset(addr.direction());
+        if allocated {
+            self.bitmap |= 1 << offset;
+        } else {
+            self.bitmap &= !(1 << offset);
+        }
+    }
+
+    fn is_stalled(
+        &self,
+        regs: &UsbRegisters,
+        addr: EndpointAddress,
+    ) -> bool {
+        if addr.index() >= P::ENDPOINT_COUNT {
+            return true;
+        }
+        crate::endpoint::is_stalled(*regs, addr)
+    }
+
+    fn set_stalled(
+        &self,
+        regs: &UsbRegisters,
+        addr: EndpointAddress,
+        stalled: bool,
+    ) {
+        if addr.index() >= P::ENDPOINT_COUNT {
+            return;
+        }
+        crate::endpoint::set_stalled(*regs, addr, stalled)
+    }
+
+}
+
 pub struct USB<P> {
     regs: Mutex<UsbRegisters>,
     out_packet: Mutex<RefCell<Packet>>,
     setup_packet: Mutex<RefCell<Packet>>,
+    endpoints: EndpointStack<P>,
     _marker: PhantomData<P>,
 }
 
@@ -75,9 +178,10 @@ impl <P: UsbPeripheral> USB<P> {
     pub fn new() -> Self {
         Self {
             regs: Mutex::new(UsbRegisters::new::<P>()),
-            _marker: PhantomData,
             out_packet: Mutex::new(RefCell::new(Default::default())),
             setup_packet: Mutex::new(RefCell::new(Default::default())),
+            endpoints: EndpointStack::new(),
+            _marker: PhantomData,
         }
     }
 
@@ -378,12 +482,16 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
     fn alloc_ep(
         &mut self,
         ep_dir: UsbDirection,
-        _ep_addr: Option<EndpointAddress>,
-        _ep_type: EndpointType,
-        _max_packet_size: u16,
-        _interval: u8,
+        ep_addr: Option<EndpointAddress>,
+        ep_type: EndpointType,
+        max_packet_size: u16,
+        interval: u8,
     ) -> Result<EndpointAddress> {
-        Ok(EndpointAddress::from_parts(0, ep_dir))
+        if let Some(0) = ep_addr.map(|a| a.index()) {
+            self.endpoints.allocate_ep0(ep_dir)
+        } else {
+            self.endpoints.allocate(ep_dir, ep_type, max_packet_size, interval)
+        }
     }
 
     fn set_device_address(&self, addr: u8) {
@@ -394,22 +502,16 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
     }
 
     fn set_stalled(&self, ep_addr: EndpointAddress, stalled: bool) {
-        if ep_addr.index() >= P::ENDPOINT_COUNT {
-            return;
-        }
         interrupt::free(|cs| {
             let regs = self.regs.borrow(cs);
-            crate::endpoint::set_stalled(*regs, ep_addr, stalled)
+            self.endpoints.set_stalled(regs, ep_addr, stalled)
         });
     }
 
     fn is_stalled(&self, ep_addr: EndpointAddress) -> bool {
-        if ep_addr.index() >= P::ENDPOINT_COUNT {
-            return true;
-        }
         interrupt::free(|cs| {
             let regs = self.regs.borrow(cs);
-            crate::endpoint::is_stalled(*regs, ep_addr)
+            self.endpoints.is_stalled(regs, ep_addr)
         })
     }
 
