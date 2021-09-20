@@ -22,11 +22,13 @@ use crate::{
         otg_pwrclk,
         endpoint_in,
         endpoint_out,
+        endpoint0_out,
     },
     target::{
         UsbRegisters,
         interrupt::{self, Mutex, CriticalSection},
     },
+    transition::EndpointDescriptor,
 };
 
 struct Packet {
@@ -64,22 +66,31 @@ impl Default for Packet {
 }
 
 struct EndpointStack<P> {
-    bitmap: u8,
+    descriptors_in: [Option<EndpointDescriptor>; 4],
+    descriptors_out: [Option<EndpointDescriptor>; 4],
     _peripheral_marker: PhantomData<P>,
 }
 impl <P: UsbPeripheral> EndpointStack<P> {
 
     fn new() -> Self {
         Self {
-            bitmap: 0,
+            descriptors_in: [None, None, None, None],
+            descriptors_out: [None, None, None, None],
             _peripheral_marker: PhantomData,
         }
     }
 
-    fn allocate_ep0(&mut self, dir: UsbDirection) -> Result<EndpointAddress> {
-        let addr = EndpointAddress::from_parts(0, dir);
-        self.set_allocated(addr, true);
-        Ok(addr)
+    fn allocate_ep0(&mut self, dir: UsbDirection, max_packet_size: u16) -> Result<EndpointAddress> {
+        let address = EndpointAddress::from_parts(0, dir);
+        let descriptor = EndpointDescriptor {
+            address,
+            max_packet_size,
+            ep_type: EndpointType::Control,
+            interval: 0,
+        };
+        let stack = self.get_stack_mut(dir);
+        stack[0] = Some(descriptor);
+        Ok(address)
     }
 
     fn allocate(
@@ -97,26 +108,38 @@ impl <P: UsbPeripheral> EndpointStack<P> {
             if self.is_allocated(address) {
                 continue;
             }
-            self.set_allocated(address, true);
+            let descriptor = EndpointDescriptor {
+                address,
+                ep_type,
+                max_packet_size,
+                interval,
+            };
+            let stack = self.get_stack_mut(ep_dir);
+            stack[i] = Some(descriptor);
             return Ok(address);
         }
         Err(UsbError::InvalidEndpoint)
     }
 
-    fn bitmap_offset(&self, dir: UsbDirection) -> u8 {
+    fn get_stack_mut(&mut self, dir: UsbDirection) -> &mut [Option<EndpointDescriptor>] {
         match dir {
-            UsbDirection::In => 0,
-            UsbDirection::Out => 4,
+            UsbDirection::In => &mut self.descriptors_in,
+            UsbDirection::Out => &mut self.descriptors_out,
         }
     }
 
-    fn bitmap_nybble(&self, dir: UsbDirection) -> u8 {
-        (self.bitmap >> self.bitmap_offset(dir)) & 0b1111
+    fn get_stack(&self, dir: UsbDirection) -> &[Option<EndpointDescriptor>] {
+        match dir {
+            UsbDirection::In => &self.descriptors_in,
+            UsbDirection::Out => &self.descriptors_out,
+        }
     }
 
     fn num_allocated(&self, ep_dir: UsbDirection) -> usize {
-        self.bitmap_nybble(ep_dir)
-            .count_ones() as usize
+        self.get_stack(ep_dir)
+            .iter()
+            .filter(|desc| desc.is_some())
+            .count()
     }
 
     fn is_allocated(&self, addr: EndpointAddress) -> bool {
@@ -124,20 +147,7 @@ impl <P: UsbPeripheral> EndpointStack<P> {
         if index >= P::ENDPOINT_COUNT {
             return false;
         }
-        (self.bitmap_nybble(addr.direction()) >> index) & 1 == 1
-    }
-
-    fn set_allocated(&mut self, addr: EndpointAddress, allocated: bool) {
-        let index = addr.index();
-        if index >= P::ENDPOINT_COUNT {
-            return;
-        }
-        let offset = self.bitmap_offset(addr.direction());
-        if allocated {
-            self.bitmap |= 1 << offset;
-        } else {
-            self.bitmap &= !(1 << offset);
-        }
+        self.get_stack(addr.direction())[index].is_some()
     }
 
     fn is_stalled(
@@ -163,6 +173,117 @@ impl <P: UsbPeripheral> EndpointStack<P> {
         crate::endpoint::set_stalled(*regs, addr, stalled)
     }
 
+    fn is_enabled(
+        &self,
+        regs: &UsbRegisters,
+        addr: EndpointAddress,
+    ) -> bool {
+        let epena = match addr.direction() {
+            UsbDirection::In => {
+                let ep = regs.endpoint_in(addr.index() as usize);
+                read_reg!(endpoint_in, ep, DIEPCTL, EPENA)
+            },
+            UsbDirection::Out => {
+                let ep = regs.endpoint_out(addr.index() as usize);
+                read_reg!(endpoint_out, ep, DOEPCTL, EPENA)
+            },
+        };
+        epena != 0
+    }
+
+    fn configure_all(&self, regs: &UsbRegisters) {
+        for i in 1..P::ENDPOINT_COUNT {
+            if let Some(desc) = self.descriptors_in[i].as_ref() {
+                self.configure_in(regs, desc);
+            }
+            if let Some(desc) = self.descriptors_out[i].as_ref() {
+                self.configure_out(regs, desc);
+            }
+        }
+    }
+
+    fn configure_in(&self, regs: &UsbRegisters, desc: &EndpointDescriptor) {
+        let index = desc.address.index();
+        let max_packet_size = desc.max_packet_size;
+        let ep_regs = regs.endpoint_in(index);
+        if index == 0 {
+            let mpsiz = match max_packet_size {
+                8 => 0b11,
+                16 => 0b10,
+                32 => 0b01,
+                64 => 0b00,
+                other => panic!("Unsupported EP0 size: {}", other),
+            };
+
+            write_reg!(endpoint_in, ep_regs, DIEPCTL, MPSIZ: mpsiz as u32, SNAK: 1);
+            write_reg!(endpoint_in, ep_regs, DIEPTSIZ, PKTCNT: 0, XFRSIZ: max_packet_size as u32);
+        } else {
+            write_reg!(endpoint_in, ep_regs, DIEPCTL,
+                SNAK: 1,
+                USBAEP: 1,
+                EPTYP: desc.ep_type as u32,
+                SD0PID_SEVNFRM: 1,
+                TXFNUM: index as u32,
+                MPSIZ: max_packet_size as u32
+            );
+        }
+    }
+
+    fn configure_out(&self, regs: &UsbRegisters, desc: &EndpointDescriptor) {
+        let index = desc.address.index();
+        let max_packet_size = desc.max_packet_size;
+        if index == 0 {
+            let mpsiz = match max_packet_size {
+                8 => 0b11,
+                16 => 0b10,
+                32 => 0b01,
+                64 => 0b00,
+                other => panic!("Unsupported EP0 size: {}", other),
+            };
+
+            let regs = regs.endpoint0_out();
+            write_reg!(endpoint0_out, regs, DOEPTSIZ0, STUPCNT: 1, PKTCNT: 1, XFRSIZ: max_packet_size as u32);
+            modify_reg!(endpoint0_out, regs, DOEPCTL0, MPSIZ: mpsiz as u32, EPENA: 1, CNAK: 1);
+        } else {
+            let regs = regs.endpoint_out(index as usize);
+            write_reg!(endpoint_out, regs, DOEPCTL,
+                SD0PID_SEVNFRM: 1,
+                CNAK: 1,
+                EPENA: 1,
+                USBAEP: 1,
+                EPTYP: desc.ep_type as u32,
+                MPSIZ: max_packet_size as u32
+            );
+        }
+    }
+
+    fn write(&self, regs: &UsbRegisters, addr: EndpointAddress, buf: &[u8]) -> Result<usize> {
+        let len = buf.len();
+        let len_words = (len + 3) / 4;
+        let index = addr.index() as usize;
+        let ep_regs = regs.endpoint_in(index);
+        if index != 0 && !self.is_enabled(regs, addr) {
+            return Err(UsbError::WouldBlock);
+        }
+        let descriptor = self.descriptors_in[index].as_ref().unwrap();
+        let max_packet_size = descriptor.max_packet_size;
+        let available_space = read_reg!(endpoint_in, ep_regs,
+            DTXFSTS,
+            INEPTFSAV
+        ) as usize;
+        if len_words > available_space {
+            return Err(UsbError::WouldBlock);
+        }
+        let packet_count = (len + 1) / (max_packet_size as usize);
+        modify_reg!(endpoint_in, ep_regs,
+            DIEPTSIZ,
+            PKTCNT: packet_count as u32,
+            XFRSIZ: len as u32
+        );
+        modify_reg!(endpoint_in, ep_regs, DIEPCTL, EPENA: 1, CNAK: 1);
+        crate::target::fifo_write(*regs, index, buf);
+        Ok(len)
+    }
 }
 
 pub struct USB<P> {
@@ -399,6 +520,7 @@ impl <P: UsbPeripheral> USB<P> {
             EPENA: 1,
             CNAK: 1
         );
+        self.endpoints.configure_all(regs);
     }
 
     fn reset(&self, regs: &UsbRegisters) {
@@ -406,25 +528,7 @@ impl <P: UsbPeripheral> USB<P> {
     }
 
     fn write(&self, regs: &UsbRegisters, ep_addr: EndpointAddress, buf: &[u8]) -> Result<usize> {
-        let len = buf.len();
-        let index = ep_addr.index() as usize;
-        let ep_regs = regs.endpoint_in(index);
-        let available_space = read_reg!(endpoint_in, ep_regs,
-            DTXFSTS,
-            INEPTFSAV
-        ) as usize;
-        if len > available_space {
-            return Err(UsbError::BufferOverflow);
-        }
-        let packet_count = if len == available_space { 2 } else { 1 };
-        modify_reg!(endpoint_in, ep_regs,
-            DIEPTSIZ,
-            PKTCNT: packet_count,
-            XFRSIZ: len as u32
-        );
-        modify_reg!(endpoint_in, ep_regs, DIEPCTL, EPENA: 1, CNAK: 1);
-        crate::target::fifo_write(*regs, index, buf);
-        Ok(len)
+        self.endpoints.write(regs, ep_addr, buf)
     }
 
     fn read_fifo(&self, regs: &UsbRegisters, buf: &mut[u8]) -> Result<usize> {
@@ -488,7 +592,7 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
         interval: u8,
     ) -> Result<EndpointAddress> {
         if let Some(0) = ep_addr.map(|a| a.index()) {
-            self.endpoints.allocate_ep0(ep_dir)
+            self.endpoints.allocate_ep0(ep_dir, max_packet_size)
         } else {
             self.endpoints.allocate(ep_dir, ep_type, max_packet_size, interval)
         }
