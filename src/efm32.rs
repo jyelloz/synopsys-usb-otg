@@ -12,19 +12,14 @@ use usb_device::{
 
 use crate::{
     UsbPeripheral,
-    endpoint::{
-        EndpointIn,
-        EndpointOut,
-    },
-    endpoint_memory::{
-        EndpointBuffer,
-        EndpointBufferState,
-    },
+    bus::EndpointAllocator,
+    endpoint_memory::EndpointBufferState,
     ral::{
         read_reg,
         write_reg,
         modify_reg,
         otg_global,
+        otg_global_dieptxfx,
         otg_device,
         otg_pwrclk,
         endpoint_in,
@@ -34,164 +29,20 @@ use crate::{
         UsbRegisters,
         interrupt::{self, Mutex, CriticalSection},
     },
-    transition::EndpointDescriptor,
 };
-
-struct EndpointStack<P> {
-    endpoints_in: [Option<EndpointIn>; 4],
-    endpoints_out: [Option<EndpointOut>; 4],
-    input_buffers: [ [u32; 32]; 4],
-    _peripheral_marker: PhantomData<P>,
-}
-
-impl <P: UsbPeripheral> EndpointStack<P> {
-
-    fn new() -> Self {
-        Self {
-            endpoints_in: [None, None, None, None],
-            endpoints_out: [None, None, None, None],
-            input_buffers: [ [0; 32]; 4],
-            _peripheral_marker: PhantomData,
-        }
-    }
-
-    fn endpoint_buffer_for_index(&mut self, index: usize) -> EndpointBuffer {
-        let p = &mut self.input_buffers[index] as *mut [u32];
-        let static_buffer = unsafe {
-            &mut * p as &'static mut [u32]
-        };
-        EndpointBuffer::new(static_buffer)
-    }
-
-    fn allocate_ep0(&mut self, dir: UsbDirection, max_packet_size: u16) -> Result<EndpointAddress> {
-        let address = EndpointAddress::from_parts(0, dir);
-        let descriptor = EndpointDescriptor {
-            address,
-            max_packet_size,
-            ep_type: EndpointType::Control,
-            interval: 0,
-        };
-        match dir {
-            UsbDirection::In => {
-                self.endpoints_in[0] = Some(EndpointIn::new::<P>(descriptor));
-            },
-            UsbDirection::Out => {
-                let buffer = self.endpoint_buffer_for_index(0);
-                self.endpoints_out[0] = Some(EndpointOut::new::<P>(descriptor, buffer));
-            },
-        }
-        Ok(address)
-    }
-
-    fn allocate(
-        &mut self,
-        ep_dir: UsbDirection,
-        ep_type: EndpointType,
-        max_packet_size: u16,
-        interval: u8,
-    ) -> Result<EndpointAddress> {
-        for i in 1..P::ENDPOINT_COUNT {
-            let address = EndpointAddress::from_parts(i, ep_dir);
-            if self.is_allocated(address) {
-                continue;
-            }
-            let descriptor = EndpointDescriptor {
-                address,
-                ep_type,
-                max_packet_size,
-                interval,
-            };
-            match ep_dir {
-                UsbDirection::In => {
-                    let endpoint = EndpointIn::new::<P>(descriptor);
-                    self.endpoints_in[i] = Some(endpoint);
-                },
-                UsbDirection::Out => {
-                    let buffer = self.endpoint_buffer_for_index(i);
-                    let endpoint = EndpointOut::new::<P>(descriptor, buffer);
-                    self.endpoints_out[i] = Some(endpoint);
-                },
-            }
-            return Ok(address);
-        }
-        Err(UsbError::EndpointOverflow)
-    }
-
-    fn is_allocated(&self, addr: EndpointAddress) -> bool {
-        let index = addr.index();
-        if index >= P::ENDPOINT_COUNT {
-            return false;
-        }
-        match addr.direction() {
-            UsbDirection::In => self.endpoints_in[index].is_some(),
-            UsbDirection::Out => self.endpoints_out[index].is_some(),
-        }
-    }
-
-    fn is_stalled(
-        &self,
-        regs: &UsbRegisters,
-        addr: EndpointAddress,
-    ) -> bool {
-        if addr.index() >= P::ENDPOINT_COUNT {
-            return true;
-        }
-        crate::endpoint::is_stalled(*regs, addr)
-    }
-
-    fn set_stalled(
-        &self,
-        regs: &UsbRegisters,
-        addr: EndpointAddress,
-        stalled: bool,
-    ) {
-        if addr.index() >= P::ENDPOINT_COUNT {
-            return;
-        }
-        crate::endpoint::set_stalled(*regs, addr, stalled)
-    }
-
-    fn configure_all(&self, cs: &CriticalSection) {
-        for i in 0..P::ENDPOINT_COUNT {
-            if let Some(ep) = self.endpoints_in[i].as_ref() {
-                ep.configure(cs);
-            }
-            if let Some(ep) = self.endpoints_out[i].as_ref() {
-                ep.configure(cs);
-            }
-        }
-    }
-
-    fn write(&self, addr: EndpointAddress, buf: &[u8]) -> Result<usize> {
-        if addr.direction() != UsbDirection::In {
-            return Err(UsbError::Unsupported);
-        }
-        let index = addr.index();
-        if let Some(ep) = self.endpoints_in[index as usize].as_ref() {
-            ep.write(buf)?;
-            Ok(buf.len())
-        } else {
-            Err(UsbError::InvalidEndpoint)
-        }
-    }
-
-    fn read(&self, addr: EndpointAddress, buf: &mut [u8]) -> Result<usize> {
-        self.endpoints_out[addr.index()].as_ref().unwrap().read(buf)
-    }
-}
 
 pub struct USB<P> {
     regs: Mutex<UsbRegisters>,
-    endpoints: EndpointStack<P>,
+    allocator: EndpointAllocator<P>,
     _marker: PhantomData<P>,
 }
 
 impl <P: UsbPeripheral> USB<P> {
 
-    pub fn new() -> Self {
+    pub fn new(memory: &'static mut [u32]) -> Self {
         Self {
             regs: Mutex::new(UsbRegisters::new::<P>()),
-            endpoints: EndpointStack::new(),
+            allocator: EndpointAllocator::new(memory),
             _marker: PhantomData,
         }
     }
@@ -250,7 +101,8 @@ impl <P: UsbPeripheral> USB<P> {
 
     }
 
-    fn set_device_address(&self, regs: &UsbRegisters, addr: u32) {
+    fn set_device_address(&self, cs: &CriticalSection, addr: u32) {
+        let regs = self.regs.borrow(cs);
         modify_reg!(otg_device, regs.device(), DCFG, DAD: addr);
     }
 
@@ -266,8 +118,7 @@ impl <P: UsbPeripheral> USB<P> {
 
         if reset != 0 {
             write_reg!(otg_global, regs.global(), GINTSTS, USBRST: 1);
-            self.handle_reset(regs);
-            return PollResult::None;
+            self.handle_reset(cs);
         }
 
         if enum_done != 0 {
@@ -297,108 +148,89 @@ impl <P: UsbPeripheral> USB<P> {
             PKTSTS
         );
         if rxflvl != 0 {
+            let out_ep = regs.endpoint_out(epnum as usize);
+            let in_ep = regs.endpoint_in(epnum as usize);
             match status {
                 0x02 => { // OUT received
-                    let ep_regs = regs.endpoint_out(epnum as usize);
-                    let ep = &self.endpoints.endpoints_out[epnum as usize];
-                    if let Some(ep) = ep {
-                        let mut buffer = ep.buffer.borrow(cs).borrow_mut();
-                        let result = buffer.fill_from_fifo(
-                            *regs,
-                            data_size as u16,
-                            false,
-                        );
-                        match result {
-                            Ok(_) => {
-                                modify_reg!(endpoint_out, ep_regs, DOEPCTL, CNAK: 1, EPENA: 1);
-                                ep_out |= 1 << epnum;
-                            },
-                            Err(UsbError::WouldBlock) => {
-                                bkpt();
-                            },
-                            _ => {
-                                bkpt();
-                            }
-                        }
-                    }
+                    ep_out |= 1 << epnum;
                 },
                 0x06 => { // SETUP received
-                    let ep_out = regs.endpoint_out(epnum as usize);
-                    let ep_in = regs.endpoint_in(epnum as usize);
-                    if read_reg!(endpoint_in, ep_in, DIEPTSIZ, PKTCNT) != 0 {
+                    if read_reg!(endpoint_in, in_ep, DIEPTSIZ, PKTCNT) != 0 {
                         modify_reg!(otg_global, regs.global(), GRSTCTL, TXFNUM: epnum, TXFFLSH: 1);
                         while read_reg!(otg_global, regs.global(), GRSTCTL, TXFFLSH) == 1 {}
                     }
-                    let ep = &self.endpoints.endpoints_out[epnum as usize];
-                    if let Some(ep) = ep {
-                        let mut buffer = ep.buffer.borrow(cs).borrow_mut();
-                        let result = buffer.fill_from_fifo(
-                            *regs,
-                            data_size as u16,
-                            true,
-                        );
-                        match result {
-                            Ok(_) => {
-                                modify_reg!(endpoint_out, ep_out, DOEPCTL, CNAK: 1, EPENA: 1);
-                                ep_setup |= 1 << epnum;
-                            },
-                            Err(UsbError::WouldBlock) => {
-                                bkpt();
-                            },
-                            _ => {
-                                bkpt();
-                            }
-                        }
-                    }
+                    ep_setup |= 1 << epnum;
                 },
                 0x03 | 0x04 => { // OUT completed | SETUP completed
                     modify_reg!(otg_device, regs.device(), DOEPTSIZ0, STUPCNT: 1);
                     modify_reg!(otg_device, regs.device(), DOEPCTL0, CNAK: 1, EPENA: 1);
-                    return PollResult::None;
                 },
                 _ => { },
             }
 
-            if status == 0x02 || status == 0x06 {
-                if iep != 0 {
-                    for ep in 0..3usize {
-                        let ep_regs = regs.endpoint_in(ep);
-                        if read_reg!(endpoint_in, ep_regs, DIEPINT, XFRC) != 0 {
-                            write_reg!(endpoint_in, ep_regs, DIEPINT, XFRC: 1);
-                            ep_in_complete |= 1 << ep;
-                        }
-                    }
-                }
-            }
-
-            for ep in &self.endpoints.endpoints_out {
+            if let 0x02 | 0x06 = status {
+                let ep = &self.allocator.endpoints_out[epnum as usize];
                 if let Some(ep) = ep {
-                    match ep.buffer_state() {
-                        EndpointBufferState::DataOut => {
-                            ep_out |= 1 << ep.address().index();
-                        },
-                        EndpointBufferState::DataSetup => {
-                            ep_setup |= 1 << ep.address().index();
-                        },
-                        EndpointBufferState::Empty => {},
+                    let mut buffer = ep.buffer.borrow(cs).borrow_mut();
+                    if buffer.state() == EndpointBufferState::Empty {
+                        let is_setup = status == 0x06;
+                        buffer.fill_from_fifo(
+                            *regs,
+                            data_size as u16,
+                            is_setup,
+                        ).ok();
                     }
-                }
-            }
-
-            if (ep_out | ep_in_complete | ep_setup) != 0 {
-                return PollResult::Data {
-                    ep_out,
-                    ep_in_complete,
-                    ep_setup,
+                    modify_reg!(endpoint_out, out_ep, DOEPCTL, CNAK: 1, EPENA: 1);
                 }
             }
         }
 
-        PollResult::None
+        if iep != 0 {
+            for ep in &self.allocator.endpoints_in {
+                if let Some(ep) = ep {
+                    let index = ep.address().index();
+                    let ep_regs = regs.endpoint_in(index);
+                    if read_reg!(endpoint_in, ep_regs, DIEPINT, XFRC) != 0 {
+                        write_reg!(endpoint_in, ep_regs, DIEPINT, XFRC: 1);
+                        ep_in_complete |= 1 << index;
+                    }
+                }
+            }
+        }
+
+        for ep in &self.allocator.endpoints_out {
+            if let Some(ep) = ep {
+                match ep.buffer_state() {
+                    EndpointBufferState::DataOut => {
+                        ep_out |= 1 << ep.address().index();
+                    },
+                    EndpointBufferState::DataSetup => {
+                        ep_setup |= 1 << ep.address().index();
+                    },
+                    EndpointBufferState::Empty => {},
+                }
+            }
+        }
+
+        if (ep_out | ep_in_complete | ep_setup) != 0 {
+            PollResult::Data {
+                ep_out,
+                ep_in_complete,
+                ep_setup,
+            }
+        } else {
+            PollResult::None
+        }
     }
 
     // 14.4.4.1.1
-    fn handle_reset(&self, regs: &UsbRegisters) {
+    fn handle_reset(&self, cs: &CriticalSection) {
+
+        let regs = self.regs.borrow(cs);
+
+        self.deconfigure_all(cs);
+        modify_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH: 1);
+        while read_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH) == 1 {}
 
         // 1.
         modify_reg!(otg_device, regs.device(), DOEPCTL0, SNAK: 1);
@@ -407,10 +239,6 @@ impl <P: UsbPeripheral> USB<P> {
         modify_reg!(otg_device, regs.device(), DOEPCTL3, SNAK: 1);
 
         // 2.
-        modify_reg!(otg_device, regs.device(), DAINTMSK,
-            IEPM: (1 << 0),
-            OEPM: (1 << 0)
-        );
         modify_reg!(otg_device, regs.device(), DOEPMSK,
             XFRCM: 1,
             STUPM: 1
@@ -426,18 +254,9 @@ impl <P: UsbPeripheral> USB<P> {
             RXFLVLM: 1
         );
 
-        // 4.
-        modify_reg!(otg_global, regs.global(), GRXFSIZ,
-            RXFD: 256
-        );
-        write_reg!(otg_global, regs.global(), DIEPTXF0,
-            TX0FD: 64,
-            TX0FSA: 512
-        );
-
         // 5.
         modify_reg!(otg_device, regs.device(), DOEPTSIZ0,
-            STUPCNT: 1
+            STUPCNT: 3
         );
     }
 
@@ -455,11 +274,99 @@ impl <P: UsbPeripheral> USB<P> {
     }
 
     fn reset(&self, cs: &CriticalSection) {
-        self.endpoints.configure_all(cs);
-        let regs = self.regs.borrow(cs);
-        self.set_device_address(regs, 0);
+        self.configure_all(cs);
+        self.set_device_address(cs, 0);
     }
 
+    fn force_reset(&self, cs: &CriticalSection) -> Result<()> {
+
+        self.deconfigure_all(cs);
+        self.reset(cs);
+        let regs = self.regs.borrow(cs);
+
+        modify_reg!(otg_device, regs.device(), DCTL, SDIS: 1);
+        // 35 cycles should be ok but giving it more time.
+        cortex_m::asm::delay(100);
+        modify_reg!(otg_device, regs.device(), DCTL, SDIS: 0);
+        Ok(())
+    }
+
+    fn configure_all(&self, cs: &CriticalSection) {
+
+        let regs = self.regs.borrow(cs);
+
+        let rx_fifo_size = self.allocator.memory_allocator
+            .total_rx_buffer_size_words() + 30;
+
+        write_reg!(otg_global, regs.global(),
+            GRXFSIZ,
+            rx_fifo_size as u32
+        );
+
+        let mut fifo_top = rx_fifo_size;
+        let fifo_size = self.allocator.memory_allocator.tx_fifo_size_words(0);
+
+        write_reg!(otg_global, regs.global(), DIEPTXF0,
+            TX0FD: fifo_size as u32,
+            TX0FSA: fifo_top as u32
+        );
+        let ep0_in = self.allocator.endpoints_in[0].as_ref();
+        let ep0_out = self.allocator.endpoints_out[0].as_ref();
+
+        if let Some(ep) = ep0_in {
+            ep.configure(cs);
+        }
+        if let Some(ep) = ep0_out {
+            ep.configure(cs);
+        }
+
+        fifo_top += fifo_size;
+
+        modify_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH: 1, TXFFLSH: 1, TXFNUM: 0x10);
+        while read_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH, TXFFLSH) != (0, 0) {}
+        for i in 1..P::ENDPOINT_COUNT {
+            if let Some(ep) = self.allocator.endpoints_in[i].as_ref() {
+                let index = ep.address().index();
+                let dieptxfx = regs.dieptxfx(i);
+                let fifo_size = self.allocator.memory_allocator.tx_fifo_size_words(i);
+                write_reg!(otg_global_dieptxfx, dieptxfx, DIEPTXFx,
+                    INEPTXFD: fifo_size as u32,
+                    INEPTXSA: fifo_top as u32
+                );
+                modify_reg!(otg_device, regs.device(), DAINTMSK, |v| v | (0x0001 << index));
+                fifo_top += fifo_size;
+                ep.configure(cs);
+            }
+            if let Some(ep) = self.allocator.endpoints_out[i].as_ref() {
+                ep.configure(cs);
+            }
+        }
+    }
+
+    pub fn deconfigure_all(&self, cs: &CriticalSection) {
+        let regs = self.regs.borrow(cs);
+
+        // disable interrupts
+        modify_reg!(otg_device, regs.device(), DAINTMSK, IEPM: 0, OEPM: 0);
+
+        for ep in &self.allocator.endpoints_in[1..] {
+            if let Some(ep) = ep {
+                ep.deconfigure(cs);
+            }
+        }
+
+        for ep in &self.allocator.endpoints_out[1..] {
+            if let Some(ep) = ep {
+                ep.deconfigure(cs);
+            }
+        }
+    }
+
+    fn set_stalled(&self, cs: &CriticalSection, addr: EndpointAddress, stalled:
+        bool) {
+        let regs = self.regs.borrow(cs);
+        crate::endpoint::set_stalled(*regs, addr, stalled)
+    }
 }
 
 impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
@@ -472,31 +379,23 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
         max_packet_size: u16,
         interval: u8,
     ) -> Result<EndpointAddress> {
-        if let Some(0) = ep_addr.map(|a| a.index()) {
-            self.endpoints.allocate_ep0(ep_dir, max_packet_size)
-        } else {
-            self.endpoints.allocate(ep_dir, ep_type, max_packet_size, interval)
-        }
+        self.allocator.alloc_ep(ep_dir, ep_addr, ep_type, max_packet_size, interval)
     }
 
     fn set_device_address(&self, addr: u8) {
-        interrupt::free(|cs| {
-            let regs = self.regs.borrow(cs);
-            self.set_device_address(regs, addr.into());
-        });
+        interrupt::free(|cs| self.set_device_address(cs, addr.into()));
     }
 
     fn set_stalled(&self, ep_addr: EndpointAddress, stalled: bool) {
         interrupt::free(|cs| {
-            let regs = self.regs.borrow(cs);
-            self.endpoints.set_stalled(regs, ep_addr, stalled)
+            self.set_stalled(cs, ep_addr, stalled)
         });
     }
 
     fn is_stalled(&self, ep_addr: EndpointAddress) -> bool {
         interrupt::free(|cs| {
             let regs = self.regs.borrow(cs);
-            self.endpoints.is_stalled(regs, ep_addr)
+            crate::endpoint::is_stalled(*regs, ep_addr)
         })
     }
 
@@ -516,12 +415,31 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
         interrupt::free(|cs| self.reset(cs));
     }
 
+    fn force_reset(&self) -> Result<()> {
+        interrupt::free(|cs| self.force_reset(cs))
+    }
+
     fn read(&self, addr: EndpointAddress, buf: &mut [u8]) -> Result<usize> {
-        self.endpoints.read(addr, buf)
+        if !addr.is_out() || addr.index() >= P::ENDPOINT_COUNT {
+            return Err(UsbError::InvalidEndpoint);
+        }
+
+        if let Some(ep) = &self.allocator.endpoints_out[addr.index()] {
+            ep.read(buf)
+        } else {
+            Err(UsbError::InvalidEndpoint)
+        }
     }
 
     fn write(&self, addr: EndpointAddress, buf: &[u8]) -> Result<usize> {
-        self.endpoints.write(addr, buf)
+        if !addr.is_in() || addr.index() >= P::ENDPOINT_COUNT {
+            return Err(UsbError::InvalidEndpoint);
+        }
+        if let Some(ep) = &self.allocator.endpoints_in[addr.index()] {
+            ep.write(buf).map(|_| buf.len())
+        } else {
+            Err(UsbError::InvalidEndpoint)
+        }
     }
 
     fn poll(&self) -> PollResult {
