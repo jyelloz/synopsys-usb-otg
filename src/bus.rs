@@ -233,14 +233,14 @@ pub enum UlpiError {
 pub struct EndpointAllocator<USB> {
     bitmap_in: u8,
     bitmap_out: u8,
-    endpoints_in: [Option<EndpointIn>; 9],
-    endpoints_out: [Option<EndpointOut>; 9],
-    memory_allocator: EndpointMemoryAllocator<USB>,
+    pub endpoints_in: [Option<EndpointIn>; 9],
+    pub endpoints_out: [Option<EndpointOut>; 9],
+    pub memory_allocator: EndpointMemoryAllocator<USB>,
     _marker: PhantomData<USB>,
 }
 
 impl<USB: UsbPeripheral> EndpointAllocator<USB> {
-    fn new(memory: &'static mut [u32]) -> Self {
+    pub fn new(memory: &'static mut [u32]) -> Self {
         assert!(USB::ENDPOINT_COUNT <= 9);
         Self {
             bitmap_in: 0,
@@ -305,7 +305,7 @@ impl<USB: UsbPeripheral> EndpointAllocator<USB> {
         Ok(ep)
     }
 
-    fn alloc_ep(
+    pub fn alloc_ep(
         &mut self,
         ep_dir: UsbDirection,
         ep_addr: Option<EndpointAddress>,
