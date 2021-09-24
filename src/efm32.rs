@@ -407,9 +407,33 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
         });
     }
 
-    fn suspend(&self) { }
+    fn suspend(&self) {
+        interrupt::free(|cs| {
+            let regs = self.regs.borrow(cs);
+            write_reg!(otg_global, regs.global(),
+                GINTMSK,
+                USBRST: 1,
+                ENUMDNEM: 1,
+                WUIM: 1
+            );
+        });
+    }
 
-    fn resume(&self) { }
+
+    fn resume(&self) {
+        interrupt::free(|cs| {
+            let regs = self.regs.borrow(cs);
+            write_reg!(otg_global, regs.global(),
+                GINTMSK,
+                USBRST: 1,
+                ENUMDNEM: 1,
+                USBSUSPM: 1,
+                WUIM: 1,
+                IEPINT: 1,
+                RXFLVLM: 1
+            );
+        });
+    }
 
     fn reset(&self) {
         interrupt::free(|cs| self.reset(cs));
