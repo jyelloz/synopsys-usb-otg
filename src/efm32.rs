@@ -276,6 +276,24 @@ impl <P: UsbPeripheral> USB<P> {
         self.set_device_address(cs, 0);
     }
 
+    fn flush_rx_buffer(&self, regs: &UsbRegisters) {
+        modify_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH: 1);
+        while read_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH) != 0 {}
+    }
+
+    fn flush_tx_buffer(&self, regs: &UsbRegisters, endpoint_number: usize) {
+        modify_reg!(otg_global, regs.global(),
+            GRSTCTL,
+            TXFFLSH: 1,
+            TXFNUM: endpoint_number as u32
+        );
+        while read_reg!(otg_global, regs.global(), GRSTCTL, TXFFLSH) != 0 {}
+    }
+
+    fn flush_all_tx_buffers(&self, regs: &UsbRegisters) {
+        self.flush_tx_buffer(regs, 0x10)
+    }
+
     fn force_reset(&self, cs: &CriticalSection) -> Result<()> {
 
         self.deconfigure_all(cs);
