@@ -146,16 +146,14 @@ impl <P: UsbPeripheral> USB<P> {
             PKTSTS
         );
         if rxflvl != 0 {
-            let out_ep = regs.endpoint_out(epnum as usize);
-            let in_ep = regs.endpoint_in(epnum as usize);
             match status {
                 0x02 => { // OUT received
                     ep_out |= 1 << epnum;
                 },
                 0x06 => { // SETUP received
-                    if read_reg!(endpoint_in, in_ep, DIEPTSIZ, PKTCNT) != 0 {
-                        modify_reg!(otg_global, regs.global(), GRSTCTL, TXFNUM: epnum, TXFFLSH: 1);
-                        while read_reg!(otg_global, regs.global(), GRSTCTL, TXFFLSH) == 1 {}
+                    let ep_regs = regs.endpoint_in(epnum as usize);
+                    if read_reg!(endpoint_in, ep_regs, DIEPTSIZ, PKTCNT) != 0 {
+                        self.flush_tx_buffer(regs, epnum as usize);
                     }
                     ep_setup |= 1 << epnum;
                 },
@@ -168,6 +166,7 @@ impl <P: UsbPeripheral> USB<P> {
 
             if let 0x02 | 0x06 = status {
                 let ep = &self.allocator.endpoints_out[epnum as usize];
+                let ep_regs = regs.endpoint_out(epnum as usize);
                 if let Some(ep) = ep {
                     let mut buffer = ep.buffer.borrow(cs).borrow_mut();
                     if buffer.state() == EndpointBufferState::Empty {
@@ -178,7 +177,7 @@ impl <P: UsbPeripheral> USB<P> {
                             is_setup,
                         ).ok();
                     }
-                    modify_reg!(endpoint_out, out_ep, DOEPCTL, CNAK: 1, EPENA: 1);
+                    modify_reg!(endpoint_out, ep_regs, DOEPCTL, CNAK: 1, EPENA: 1);
                 }
             }
         }
@@ -227,8 +226,7 @@ impl <P: UsbPeripheral> USB<P> {
         let regs = self.regs.borrow(cs);
 
         self.deconfigure_all(cs);
-        modify_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH: 1);
-        while read_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH) == 1 {}
+        self.flush_rx_buffer(regs);
 
         // 1.
         modify_reg!(otg_device, regs.device(), DOEPCTL0, SNAK: 1);
@@ -326,22 +324,20 @@ impl <P: UsbPeripheral> USB<P> {
             TX0FD: fifo_size as u32,
             TX0FSA: fifo_top as u32
         );
-        let ep0_in = self.allocator.endpoints_in[0].as_ref();
-        let ep0_out = self.allocator.endpoints_out[0].as_ref();
-
-        if let Some(ep) = ep0_in {
-            ep.configure(cs);
-        }
-        if let Some(ep) = ep0_out {
-            ep.configure(cs);
-        }
-
         fifo_top += fifo_size;
 
-        modify_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH: 1, TXFFLSH: 1, TXFNUM: 0x10);
-        while read_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH, TXFFLSH) != (0, 0) {}
+        if let Some(ep) = &self.allocator.endpoints_in[0] {
+            ep.configure(cs);
+        }
+        if let Some(ep) = &self.allocator.endpoints_out[0] {
+            ep.configure(cs);
+        }
+
+        self.flush_rx_buffer(regs);
+        self.flush_all_tx_buffers(regs);
+
         for i in 1..P::ENDPOINT_COUNT {
-            if let Some(ep) = self.allocator.endpoints_in[i].as_ref() {
+            if let Some(ep) = &self.allocator.endpoints_in[i] {
                 let index = ep.address().index();
                 let dieptxfx = regs.dieptxfx(i);
                 let fifo_size = self.allocator.memory_allocator.tx_fifo_size_words(i);
@@ -349,11 +345,11 @@ impl <P: UsbPeripheral> USB<P> {
                     INEPTXFD: fifo_size as u32,
                     INEPTXSA: fifo_top as u32
                 );
-                modify_reg!(otg_device, regs.device(), DAINTMSK, |v| v | (0x0001 << index));
                 fifo_top += fifo_size;
+                modify_reg!(otg_device, regs.device(), DAINTMSK, |v| v | (0x0001 << index));
                 ep.configure(cs);
             }
-            if let Some(ep) = self.allocator.endpoints_out[i].as_ref() {
+            if let Some(ep) = &self.allocator.endpoints_out[i] {
                 ep.configure(cs);
             }
         }
@@ -463,7 +459,6 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
         if !addr.is_out() || addr.index() >= P::ENDPOINT_COUNT {
             return Err(UsbError::InvalidEndpoint);
         }
-
         if let Some(ep) = &self.allocator.endpoints_out[addr.index()] {
             ep.read(buf)
         } else {
