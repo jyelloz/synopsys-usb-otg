@@ -374,11 +374,6 @@ impl <P: UsbPeripheral> USB<P> {
         }
     }
 
-    fn set_stalled(&self, cs: &CriticalSection, addr: EndpointAddress, stalled:
-        bool) {
-        let regs = self.regs.borrow(cs);
-        crate::endpoint::set_stalled(*regs, addr, stalled)
-    }
 }
 
 impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
@@ -400,7 +395,8 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
 
     fn set_stalled(&self, ep_addr: EndpointAddress, stalled: bool) {
         interrupt::free(|cs| {
-            self.set_stalled(cs, ep_addr, stalled)
+            let regs = self.regs.borrow(cs);
+            crate::endpoint::set_stalled(*regs, ep_addr, stalled)
         });
     }
 
