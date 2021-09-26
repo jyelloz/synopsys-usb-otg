@@ -1,7 +1,5 @@
 use core::marker::PhantomData;
 
-use cortex_m::asm::bkpt;
-
 use usb_device::{
     Result,
     UsbDirection,
