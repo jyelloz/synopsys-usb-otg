@@ -37,10 +37,10 @@ pub struct USB<P> {
 
 impl <P: UsbPeripheral> USB<P> {
 
-    pub fn new(memory: &'static mut [u32]) -> Self {
+    pub fn new(rx_buffer: &'static mut [u32]) -> Self {
         Self {
             regs: Mutex::new(UsbRegisters::new::<P>()),
-            allocator: EndpointAllocator::new(memory),
+            allocator: EndpointAllocator::new(rx_buffer),
             _marker: PhantomData,
         }
     }
