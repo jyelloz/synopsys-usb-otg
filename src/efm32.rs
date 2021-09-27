@@ -238,12 +238,6 @@ impl <P: UsbPeripheral> USB<P> {
             TOM: 1
         );
 
-        // 3.
-        modify_reg!(otg_global, regs.global(), GINTMSK,
-            NPTXFEM: 1,
-            RXFLVLM: 1
-        );
-
         // 5.
         modify_reg!(otg_device, regs.device(), DOEPTSIZ0,
             STUPCNT: 3
