@@ -204,6 +204,17 @@ impl EndpointOut {
         write_reg!(endpoint_out, regs, DOEPINT, 0xff);
     }
 
+    pub fn fill_from_fifo(
+        &self,
+        cs: &CriticalSection,
+        data_size: u16,
+        is_setup: bool,
+    ) -> Result<()> {
+        self.buffer.borrow(cs)
+                   .borrow_mut()
+                   .fill_from_fifo(self.usb, data_size, is_setup)
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
         interrupt::free(|cs| {
             self.buffer.borrow(cs).borrow_mut().read_packet(buf)
@@ -215,6 +226,11 @@ impl EndpointOut {
             self.buffer.borrow(cs).borrow().state()
         })
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer_state() == EndpointBufferState::Empty
+    }
+
 }
 
 
