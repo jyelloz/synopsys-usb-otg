@@ -82,9 +82,7 @@ impl <P: UsbPeripheral> USB<P> {
             USBRST: 1,
             ENUMDNEM: 1,
             USBSUSPM: 1,
-            WUIM: 1,
-            IEPINT: 1,
-            RXFLVLM: 1
+            WUIM: 1
         );
 
         // clear pending interrupts
@@ -431,9 +429,7 @@ impl <P: UsbPeripheral> usb_device::bus::UsbBus for USB<P> {
                 USBRST: 1,
                 ENUMDNEM: 1,
                 USBSUSPM: 1,
-                WUIM: 1,
-                IEPINT: 1,
-                RXFLVLM: 1
+                WUIM: 1
             );
         });
     }
