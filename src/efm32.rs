@@ -21,7 +21,6 @@ use crate::{
         otg_device,
         otg_pwrclk,
         endpoint_in,
-        endpoint_out,
     },
     target::{
         UsbRegisters,
@@ -169,14 +168,12 @@ impl <P: UsbPeripheral> USB<P> {
 
             if let 0x02 | 0x06 = status {
                 let ep = &self.allocator.endpoints_out()[epnum as usize];
-                let ep_regs = regs.endpoint_out(epnum as usize);
                 if let Some(ep) = ep {
                     if ep.is_empty() {
                         read_reg!(otg_global, regs.global(), GRXSTSP);
                         let is_setup = status == 0x06;
                         ep.fill_from_fifo(cs, data_size as u16, is_setup).ok();
                     }
-                    modify_reg!(endpoint_out, ep_regs, DOEPCTL, CNAK: 1, EPENA: 1);
                 }
             }
         }
