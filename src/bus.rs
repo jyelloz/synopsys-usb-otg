@@ -567,12 +567,11 @@ impl<USB: UsbPeripheral> usb_device::bus::UsbBus for UsbBus<USB> {
 
                     if status == 0x02 || status == 0x06 {
                         if let Some(ep) = &self.allocator.endpoints_out()[epnum as usize] {
-                            let mut buffer = ep.buffer.borrow(cs).borrow_mut();
-                            if buffer.state() == EndpointBufferState::Empty {
+                            if ep.is_empty() {
                                 read_reg!(otg_global, regs.global(), GRXSTSP); // pop GRXSTSP
 
                                 let is_setup = status == 0x06;
-                                buffer.fill_from_fifo(*regs, data_size as u16, is_setup).ok();
+                                ep.fill_from_fifo(cs, data_size as u16, is_setup).ok();
 
                                 // Re-enable the endpoint, F446-like chips only
                                 if core_id == 0x0000_2000 || core_id == 0x0000_2100 ||
