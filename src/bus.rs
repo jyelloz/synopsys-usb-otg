@@ -1,15 +1,13 @@
-use core::marker::PhantomData;
 use embedded_hal::blocking::delay::DelayMs;
 use usb_device::{Result, UsbDirection, UsbError};
 use usb_device::bus::{UsbBusAllocator, PollResult};
 use usb_device::endpoint::{EndpointType, EndpointAddress};
-use crate::transition::{EndpointConfig, EndpointDescriptor};
 use crate::ral::{read_reg, write_reg, modify_reg, otg_global, otg_device, otg_pwrclk, otg_global_dieptxfx};
 
 use crate::target::UsbRegisters;
 use crate::target::interrupt::{self, Mutex, CriticalSection};
-use crate::endpoint::{EndpointIn, EndpointOut};
-use crate::endpoint_memory::{EndpointMemoryAllocator, EndpointBufferState};
+use crate::endpoint_memory::EndpointBufferState;
+pub use crate::endpoint_allocator::EndpointAllocator;
 use crate::{UsbPeripheral, PhyType};
 
 /// USB peripheral driver for STM32 microcontrollers.
@@ -43,17 +41,17 @@ impl<USB: UsbPeripheral> UsbBus<USB> {
         // In fact, the required number of words is higher than indicated in RM.
         // The following numbers are pessimistic and were figured out empirically.
         let rx_fifo_size = if USB::HIGH_SPEED {
-            self.allocator.memory_allocator.total_rx_buffer_size_words() + 30
+            self.allocator.total_rx_buffer_size_words() + 30
         } else {
             // F429 requires 35+ words for the (EP0[8] + EP2[64]) setup
             // F446 requires 39+ words for the same setup
-            self.allocator.memory_allocator.total_rx_buffer_size_words() + 30
+            self.allocator.total_rx_buffer_size_words() + 30
         };
         write_reg!(otg_global, regs.global(), GRXFSIZ, rx_fifo_size as u32);
         let mut fifo_top = rx_fifo_size;
 
         // Tx FIFO #0
-        let fifo_size = self.allocator.memory_allocator.tx_fifo_size_words(0);
+        let fifo_size = self.allocator.tx_fifo_size_words(0);
 
         #[cfg(feature = "fs")]
         write_reg!(otg_global, regs.global(), DIEPTXF0,
@@ -70,7 +68,7 @@ impl<USB: UsbPeripheral> UsbBus<USB> {
 
         // Tx FIFOs
         for i in 1..USB::ENDPOINT_COUNT {
-            let fifo_size = self.allocator.memory_allocator.tx_fifo_size_words(i);
+            let fifo_size = self.allocator.tx_fifo_size_words(i);
 
             let dieptxfx = regs.dieptxfx(i);
             write_reg!(otg_global_dieptxfx, dieptxfx, DIEPTXFx,
@@ -87,7 +85,7 @@ impl<USB: UsbPeripheral> UsbBus<USB> {
         modify_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH: 1, TXFFLSH: 1, TXFNUM: 0x10);
         while read_reg!(otg_global, regs.global(), GRSTCTL, RXFFLSH, TXFFLSH) != (0, 0) {}
 
-        for ep in &self.allocator.endpoints_in {
+        for ep in self.allocator.endpoints_in() {
             if let Some(ep) = ep {
                 // enabling EP TX interrupt
                 modify_reg!(otg_device, regs.device(), DAINTMSK, |v| v | (0x0001 << ep.address().index()));
@@ -96,7 +94,7 @@ impl<USB: UsbPeripheral> UsbBus<USB> {
             }
         }
 
-        for ep in &self.allocator.endpoints_out {
+        for ep in self.allocator.endpoints_out() {
             if let Some(ep) = ep {
                 if ep.address().index() == 0 {
                     // enabling RX interrupt from EP0
@@ -114,13 +112,13 @@ impl<USB: UsbPeripheral> UsbBus<USB> {
         // disable interrupts
         modify_reg!(otg_device, regs.device(), DAINTMSK, IEPM: 0, OEPM: 0);
 
-        for ep in &self.allocator.endpoints_in {
+        for ep in self.allocator.endpoints_in() {
             if let Some(ep) = ep {
                 ep.deconfigure(cs);
             }
         }
 
-        for ep in &self.allocator.endpoints_out {
+        for ep in self.allocator.endpoints_out() {
             if let Some(ep) = ep {
                 ep.deconfigure(cs);
             }
@@ -230,115 +228,6 @@ pub enum UlpiError {
     Timeout,
 }
 
-pub struct EndpointAllocator<USB> {
-    bitmap_in: u8,
-    bitmap_out: u8,
-    pub endpoints_in: [Option<EndpointIn>; 9],
-    pub endpoints_out: [Option<EndpointOut>; 9],
-    pub memory_allocator: EndpointMemoryAllocator<USB>,
-    _marker: PhantomData<USB>,
-}
-
-impl<USB: UsbPeripheral> EndpointAllocator<USB> {
-    pub fn new(memory: &'static mut [u32]) -> Self {
-        assert!(USB::ENDPOINT_COUNT <= 9);
-        Self {
-            bitmap_in: 0,
-            bitmap_out: 0,
-            // [None; 9] requires Copy
-            endpoints_in: [None, None, None, None, None, None, None, None, None],
-            endpoints_out: [None, None, None, None, None, None, None, None, None],
-            memory_allocator: EndpointMemoryAllocator::new(memory),
-            _marker: PhantomData
-        }
-    }
-
-    fn alloc_number(bitmap: &mut u8, number: Option<u8>) -> Result<u8> {
-        if let Some(number) = number {
-            if number as usize >= USB::ENDPOINT_COUNT {
-                return Err(UsbError::InvalidEndpoint);
-            }
-            if *bitmap & (1 << number) == 0 {
-                *bitmap |= 1 << number;
-                Ok(number)
-            } else {
-                Err(UsbError::InvalidEndpoint)
-            }
-        } else {
-            // Skip EP0
-            for number in 1..USB::ENDPOINT_COUNT {
-                if *bitmap & (1 << number) == 0 {
-                    *bitmap |= 1 << number;
-                    return Ok(number as u8)
-                }
-            }
-            Err(UsbError::EndpointOverflow)
-        }
-    }
-
-    fn alloc(bitmap: &mut u8, config: &EndpointConfig, direction: UsbDirection) -> Result<EndpointDescriptor> {
-        let number = Self::alloc_number(bitmap, config.number)?;
-        let address = EndpointAddress::from_parts(number as usize, direction);
-        Ok(EndpointDescriptor {
-            address,
-            ep_type: config.ep_type,
-            max_packet_size: config.max_packet_size,
-            interval: config.interval
-        })
-    }
-
-    fn alloc_in(&mut self, config: &EndpointConfig) -> Result<EndpointIn> {
-        let descr = Self::alloc(&mut self.bitmap_in, config, UsbDirection::In)?;
-
-        self.memory_allocator.allocate_tx_buffer(descr.address.index() as u8, descr.max_packet_size as usize)?;
-        let ep = EndpointIn::new::<USB>(descr);
-
-        Ok(ep)
-    }
-
-    fn alloc_out(&mut self, config: &EndpointConfig) -> Result<EndpointOut> {
-        let descr = Self::alloc(&mut self.bitmap_out, config, UsbDirection::Out)?;
-
-        let buffer = self.memory_allocator.allocate_rx_buffer(descr.max_packet_size as usize)?;
-        let ep = EndpointOut::new::<USB>(descr, buffer);
-
-        Ok(ep)
-    }
-
-    pub fn alloc_ep(
-        &mut self,
-        ep_dir: UsbDirection,
-        ep_addr: Option<EndpointAddress>,
-        ep_type: EndpointType,
-        max_packet_size: u16,
-        interval: u8) -> Result<EndpointAddress>
-    {
-        let ep_type = unsafe { core::mem::transmute(ep_type) };
-        let number = ep_addr.map(|a| a.index() as u8);
-
-        let config = EndpointConfig {
-            ep_type,
-            max_packet_size,
-            interval,
-            number,
-            pair_of: None
-        };
-        match ep_dir {
-            UsbDirection::Out => {
-                let ep = self.alloc_out(&config)?;
-                let address = ep.address();
-                self.endpoints_out[address.index()] = Some(ep);
-                Ok(address)
-            },
-            UsbDirection::In => {
-                let ep = self.alloc_in(&config)?;
-                let address = ep.address();
-                self.endpoints_in[address.index()] = Some(ep);
-                Ok(address)
-            },
-        }
-    }
-}
 
 impl<USB: UsbPeripheral> usb_device::bus::UsbBus for UsbBus<USB> {
     fn alloc_ep(
@@ -525,7 +414,7 @@ impl<USB: UsbPeripheral> usb_device::bus::UsbBus for UsbBus<USB> {
         if !ep_addr.is_in() || ep_addr.index() >= USB::ENDPOINT_COUNT {
             return Err(UsbError::InvalidEndpoint);
         }
-        if let Some(ep) = &self.allocator.endpoints_in[ep_addr.index()] {
+        if let Some(ep) = &self.allocator.endpoints_in()[ep_addr.index()] {
             ep.write(buf).map(|_| buf.len())
         } else {
             Err(UsbError::InvalidEndpoint)
@@ -537,7 +426,7 @@ impl<USB: UsbPeripheral> usb_device::bus::UsbBus for UsbBus<USB> {
             return Err(UsbError::InvalidEndpoint);
         }
 
-        if let Some(ep) = &self.allocator.endpoints_out[ep_addr.index()] {
+        if let Some(ep) = &self.allocator.endpoints_out()[ep_addr.index()] {
             ep.read(buf)
         } else {
             Err(UsbError::InvalidEndpoint)
@@ -677,7 +566,7 @@ impl<USB: UsbPeripheral> usb_device::bus::UsbBus for UsbBus<USB> {
                     }
 
                     if status == 0x02 || status == 0x06 {
-                        if let Some(ep) = &self.allocator.endpoints_out[epnum as usize] {
+                        if let Some(ep) = &self.allocator.endpoints_out()[epnum as usize] {
                             let mut buffer = ep.buffer.borrow(cs).borrow_mut();
                             if buffer.state() == EndpointBufferState::Empty {
                                 read_reg!(otg_global, regs.global(), GRXSTSP); // pop GRXSTSP
@@ -698,7 +587,7 @@ impl<USB: UsbPeripheral> usb_device::bus::UsbBus for UsbBus<USB> {
                 }
 
                 if iep != 0 {
-                    for ep in &self.allocator.endpoints_in {
+                    for ep in self.allocator.endpoints_in() {
                         if let Some(ep) = ep {
                             let ep_regs = regs.endpoint_in(ep.address().index());
                             if read_reg!(endpoint_in, ep_regs, DIEPINT, XFRC) != 0 {
@@ -709,7 +598,7 @@ impl<USB: UsbPeripheral> usb_device::bus::UsbBus for UsbBus<USB> {
                     }
                 }
 
-                for ep in &self.allocator.endpoints_out {
+                for ep in self.allocator.endpoints_out() {
                     if let Some(ep) = ep {
                         match ep.buffer_state() {
                             EndpointBufferState::DataOut => {
