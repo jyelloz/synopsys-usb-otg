@@ -171,15 +171,10 @@ impl <P: UsbPeripheral> USB<P> {
                 let ep = &self.allocator.endpoints_out()[epnum as usize];
                 let ep_regs = regs.endpoint_out(epnum as usize);
                 if let Some(ep) = ep {
-                    let mut buffer = ep.buffer.borrow(cs).borrow_mut();
-                    if buffer.state() == EndpointBufferState::Empty {
+                    if ep.is_empty() {
                         read_reg!(otg_global, regs.global(), GRXSTSP);
                         let is_setup = status == 0x06;
-                        buffer.fill_from_fifo(
-                            *regs,
-                            data_size as u16,
-                            is_setup,
-                        ).ok();
+                        ep.fill_from_fifo(cs, data_size as u16, is_setup).ok();
                     }
                     modify_reg!(endpoint_out, ep_regs, DOEPCTL, CNAK: 1, EPENA: 1);
                 }
