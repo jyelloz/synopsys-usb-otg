@@ -140,7 +140,7 @@ impl <P: UsbPeripheral> USB<P> {
         let (epnum, data_size, status) = read_reg!(
             otg_global,
             regs.global(),
-            GRXSTSP,
+            GRXSTSR,
             EPNUM,
             BCNT,
             PKTSTS
@@ -158,10 +158,13 @@ impl <P: UsbPeripheral> USB<P> {
                     ep_setup |= 1 << epnum;
                 },
                 0x03 | 0x04 => { // OUT completed | SETUP completed
+                    read_reg!(otg_global, regs.global(), GRXSTSP);
                     modify_reg!(otg_device, regs.device(), DOEPTSIZ0, STUPCNT: 1);
                     modify_reg!(otg_device, regs.device(), DOEPCTL0, CNAK: 1, EPENA: 1);
                 },
-                _ => { },
+                _ => {
+                    read_reg!(otg_global, regs.global(), GRXSTSP);
+                },
             }
 
             if let 0x02 | 0x06 = status {
@@ -170,6 +173,7 @@ impl <P: UsbPeripheral> USB<P> {
                 if let Some(ep) = ep {
                     let mut buffer = ep.buffer.borrow(cs).borrow_mut();
                     if buffer.state() == EndpointBufferState::Empty {
+                        read_reg!(otg_global, regs.global(), GRXSTSP);
                         let is_setup = status == 0x06;
                         buffer.fill_from_fifo(
                             *regs,
